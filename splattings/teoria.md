@@ -207,3 +207,64 @@ Clasificación topológica automática del vecindario sano. Validar en las pieza
 
 Pipeline end-to-end sobre el dataset `defectos_reales/bollos/` y `defectos_reales/picos/`. Métricas: error en volumen, largo, ancho y profundidad respecto a mediciones de referencia.
 
+
+
+Para estimar la forma original de la pieza (la "superficie fantasma") basándote únicamente en el entorno del defecto, el sistema debe realizar una clasificación topológica basada en geometría diferencial. No necesitas saber de antemano qué pieza es; la respuesta está en los puntos sanos que rodean la máscara del golpe.
+
+Aquí tienes el resumen del procedimiento para deducir la forma:
+1. El Anillo de Sondeo (Sensing Ring)
+
+Una vez detectado y segmentado el defecto, el algoritmo selecciona una "corona" de puntos (vecindario sano) inmediatamente exterior al borde del golpe. En esta zona, aplicas el filtro de Savitzky-Golay (SG) para extraer las propiedades locales de cada punto.
+2. Clasificación por Invariantes Geométricos
+
+Para cada splat o punto en ese anillo, analizamos los autovalores (κ1​,κ2​) de la matriz Hessiana proporcionada por el filtro SG. Esto nos permite clasificar el entorno en tres escenarios posibles:
+
+    Escenario A: Plano Puro
+
+        Condición: κ1​≈0 y κ2​≈0.
+
+        Interpretación: Si todo el anillo tiene curvatura nula y las normales son paralelas, el golpe está en una cara plana (como la base del cilindro).
+
+    Escenario B: Superficie de Revolución (Cilindro)
+
+        Condición: κ1​≈1/R (constante) y κ2​≈0.
+
+        Interpretación: Las normales convergen hacia un eje central. El sistema deduce que el entorno es una pared lateral curva.
+
+    Escenario C: Arista o Esquina (Bimodalidad)
+
+        Condición: El anillo contiene dos grupos de puntos con normales perpendiculares entre sí (unos con κ≈0 y otros con κ≈1/R).
+
+        Interpretación: El defecto ha "borrado" la arista que une la base con la pared.
+
+3. Reconstrucción de la Superficie Fantasma
+
+Una vez identificada la topografía, el sistema aplica una extrapolación competitiva:
+
+    Ajuste de Primitivas: Si el entorno es bimodal (arista), el algoritmo ajusta por mínimos cuadrados un plano ideal a los puntos de la base y un cilindro ideal a los puntos de la pared lateral.
+
+    Intersección Analítica: La superficie fantasma se define como la unión de estas dos funciones. La arista teórica es el lugar geométrico donde ambas funciones se encuentran.
+
+    Inpainting de Curvatura: Para superficies más complejas (como splines), se utiliza la propagación de la curvatura desde el borde hacia el interior, minimizando la energía de flexión (bending energy) para que la transición sea suave.
+
+4. Determinación del "Cero Metrológico"
+
+La superficie fantasma estimada se convierte en tu valor de referencia (Z-nominal).
+
+    Cualquier desviación medida por los splats del golpe respecto a esta superficie reconstruida se contabiliza como volumen de material faltante.
+
+    Esto permite que, incluso si la pieza entra ligeramente inclinada en la cinta transportadora, el "cero" se mueva con la pieza, eliminando errores de alineación.
+
+Resumen Lógico para Copilot:
+
+Para programar esto, el flujo es:
+
+    Extraer normales y curvaturas del anillo exterior.
+
+    Agrupar (clustering) normales similares.
+
+    Si hay un grupo: Extrapolar superficie única.
+
+    Si hay dos grupos: Calcular intersección de superficies (Arista).
+
+    Restar modelo - realidad.

@@ -18,7 +18,6 @@ Uso mínimo:
 import os, sys
 import numpy as np
 import cv2
-from collections import defaultdict
 from scipy.ndimage import median_filter, distance_transform_edt, gaussian_filter1d
 from scipy.signal import find_peaks
 from scipy.interpolate import griddata
@@ -29,16 +28,12 @@ import time
 DEFAULT_PARAMS = dict(
     erosion_px      = 5,       # erosión de la máscara YOLO (px)
     med_win         = 15,      # ventana mediana (px)
-    sg_win_px       = 21,      # ventana SG 2D (px)
-    thr_tapa_deg    = 30.0,    # umbral θ flat/wall (°)
-    n_wall_bins     = 16,      # sectores azimutal para paredes
     ring_mm         = 8.0,     # anchura anillo inpainting (mm)
-    search_mm       = 10.0,    # anchura anillo búsqueda fronteras (mm)
     k_max           = 12,      # número máximo de splats
     win_defect_mm   = 4.0,     # ventana SG local para inicializar splat (mm)
     lambda_pen      = 5.0,     # penalización splat fuera de máscara
     thr_frac        = 0.05,    # umbral envolvente splats para OBB
-    n_splat_sub     = 2000,    # submuestreo observaciones splat
+    n_splat_sub     = 500,     # submuestreo observaciones splat
 )
 
 
@@ -169,114 +164,6 @@ def segment_surfaces(Z, valid, theta, phi, defect_mask_early,
     return seg_flat, seg_wall, flat_label_img, K_flat, phi_bin, surf_label, K_surf
 
 
-def extend_labels_geometric(surf_label, valid, defect_mask, phi, pix_mm,
-                             search_mm: float, H: int, W: int):
-    """Ajusta líneas/círculos en el anillo sano y clasifica los px del defecto.
-    Modifica surf_label in-place. Devuelve surf_label."""
-    need_label  = valid & (surf_label < 0)
-    defect_bool = defect_mask.astype(bool)
-
-    search_px  = int(round(search_mm / pix_mm)) | 1
-    ker_search = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (search_px, search_px))
-    outer_srch = cv2.dilate(defect_mask, ker_search).astype(bool)
-    search_zone = outer_srch & ~defect_bool & valid
-
-    # Fronteras entre pares de etiquetas en la zona sana
-    bnd_pts = defaultdict(list)
-    sr_r, sr_c = np.where(search_zone)
-    sz_set = set(zip(sr_r.tolist(), sr_c.tolist()))
-    for r_, c_ in sz_set:
-        la = int(surf_label[r_, c_])
-        if la < 0:
-            continue
-        for dr, dc in ((0, 1), (1, 0)):
-            nr, nc = r_ + dr, c_ + dc
-            if (nr, nc) not in sz_set:
-                continue
-            lb = int(surf_label[nr, nc])
-            if lb < 0 or lb == la:
-                continue
-            key = (min(la, lb), max(la, lb))
-            bnd_pts[key].append((c_ + dc * 0.5, r_ + dr * 0.5))
-
-    def _fit_line(pts):
-        mu = pts.mean(0)
-        _, _, Vt = np.linalg.svd(pts - mu, full_matrices=False)
-        n = Vt[1]; off = float(n @ mu)
-        rms = float(np.sqrt(np.mean(((pts - mu) @ n) ** 2)))
-        return dict(type='line', n=n, off=off, rms=rms)
-
-    def _fit_circle(pts):
-        x, y = pts[:, 0], pts[:, 1]
-        A = np.column_stack([2 * x, 2 * y, np.ones(len(x))])
-        try:
-            sol = np.linalg.lstsq(A, x**2 + y**2, rcond=None)[0]
-            cx, cy, c_ = sol
-            r_ = float(np.sqrt(max(cx**2 + cy**2 + c_, 0.01)))
-            rms = float(np.sqrt(np.mean((np.sqrt((x-cx)**2 + (y-cy)**2) - r_)**2)))
-            return dict(type='circle', cx=cx, cy=cy, r=r_, rms=rms)
-        except Exception:
-            return dict(type='circle', rms=1e9)
-
-    def _sdf(bnd, cols, rows):
-        c_, r_ = np.asarray(cols, float), np.asarray(rows, float)
-        if bnd['type'] == 'line':
-            return np.column_stack([c_, r_]) @ bnd['n'] - bnd['off']
-        return np.sqrt((c_ - bnd['cx'])**2 + (r_ - bnd['cy'])**2) - bnd['r']
-
-    fitted = {}
-    for key, pts_list in bnd_pts.items():
-        if len(pts_list) < 6:
-            continue
-        pts = np.array(pts_list)
-        fl = _fit_line(pts)
-        fc = _fit_circle(pts)
-        fitted[key] = fl if fl['rms'] <= fc['rms'] else fc
-
-    def_r, def_c = np.where(need_label)
-    surf_ext = surf_label.copy()
-    classified = np.zeros(len(def_r), dtype=bool)
-
-    for (la, lb), bnd in fitted.items():
-        mask_a = (surf_label == la) & search_zone
-        mask_b = (surf_label == lb) & search_zone
-        ra, ca = np.where(mask_a)
-        rb, cb = np.where(mask_b)
-        if len(ra) < 3 or len(rb) < 3:
-            continue
-        sda = float(np.median(_sdf(bnd, ca.astype(float), ra.astype(float))))
-        sdb = float(np.median(_sdf(bnd, cb.astype(float), rb.astype(float))))
-        if np.sign(sda) == np.sign(sdb) or sda == 0 or sdb == 0:
-            continue
-        lbl_pos = la if sda > 0 else lb
-        lbl_neg = lb if sda > 0 else la
-        d_all  = _sdf(bnd, def_c.astype(float), def_r.astype(float))
-        new_lbl = np.where(d_all >= 0, lbl_pos, lbl_neg)
-        mask_act = ~classified
-        surf_ext[def_r[mask_act], def_c[mask_act]] = new_lbl[mask_act]
-        classified[mask_act] = True
-
-    # BFS fallback
-    if (~classified).any():
-        from collections import deque
-        ker4   = np.array([[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=np.uint8)
-        border = cv2.dilate(need_label.astype(np.uint8), ker4).astype(bool) & (surf_label >= 0)
-        sr, sc = np.where(border)
-        queue  = deque(zip(sr.tolist(), sc.tolist()))
-        while queue:
-            r, c = queue.popleft()
-            lbl  = surf_ext[r, c]
-            for dr, dc in ((-1, 0), (1, 0), (0, -1), (0, 1)):
-                nr, nc = r + dr, c + dc
-                if (0 <= nr < H and 0 <= nc < W
-                        and need_label[nr, nc] and surf_ext[nr, nc] < 0):
-                    surf_ext[nr, nc] = lbl
-                    queue.append((nr, nc))
-
-    surf_label[need_label] = surf_ext[need_label]
-    return surf_label, fitted
-
-
 # ═══════════════════════════════════════════════════════════════════════════════
 # 5. Z_NOM POR GRIDDATA
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -375,8 +262,13 @@ def run_multisplat(Z_source, defect_mask, valid, pix_mm,
 
     X_MIN = float(cols_def_s.min()) * pix_mm;  X_MAX = float(cols_def_s.max()) * pix_mm
     Y_MIN = float(rows_def_s.min()) * pix_mm;  Y_MAX = float(rows_def_s.max()) * pix_mm
-    SIG_LONG  = (X_MAX - X_MIN) / 2
-    SIG_SHORT = (Y_MAX - Y_MIN) / 2
+    # σ máximo por PCA de la máscara (ejes principales reales, no BB axis-aligned)
+    _xy = np.column_stack([cols_def_s.astype(np.float64) * pix_mm,
+                           rows_def_s.astype(np.float64) * pix_mm])
+    _cov = np.cov(_xy.T)
+    _eigvals = np.sort(np.linalg.eigvalsh(_cov))[::-1]  # mayor primero
+    SIG_LONG  = min(float(np.sqrt(max(_eigvals[0], 1e-6))), win_defect_mm)
+    SIG_SHORT = min(float(np.sqrt(max(_eigvals[1], 1e-6))), win_defect_mm)
 
     x_obs = cols_def_s.astype(np.float64) * pix_mm
     y_obs = rows_def_s.astype(np.float64) * pix_mm
@@ -404,6 +296,7 @@ def run_multisplat(Z_source, defect_mask, valid, pix_mm,
 
     res_all = {}; p_cur = []
     t0 = time.perf_counter()
+    _bic_best = np.inf; _bic_patience = 2; _bic_no_improve = 0
 
     for K in range(1, k_max + 1):
         prev  = gauss_mixture(p_cur, x_obs, y_obs) if p_cur else np.zeros(N_obs)
@@ -471,14 +364,28 @@ def run_multisplat(Z_source, defect_mask, valid, pix_mm,
             return np.vstack([cf['j'], Jp])
 
         rK = least_squares(fun, p0, jac=jac, bounds=(blo*K, bhi*K),
-                           method='trf', xtol=1e-9, ftol=1e-9, gtol=1e-9,
-                           max_nfev=20_000)
+                           method='trf', xtol=1e-4, ftol=1e-4, gtol=1e-4,
+                           max_nfev=5_000)
         p_cur = list(rK.x)
         V_K   = volume_mixture(p_cur)
         t_K   = time.perf_counter() - t0
         res_all[K] = dict(params=p_cur.copy(), V=V_K, nfev=rK.nfev, t=t_K)
+
+        # Early stopping: BIC inline sobre todas las observaciones (rápido)
+        _bic_K = (np.sum((z_obs_ - gauss_mixture(p_cur, x_obs, y_obs))**2)
+                  + 6 * K * float(np.var(z_obs_)))
+        if _bic_K < _bic_best:
+            _bic_best = _bic_K; _bic_no_improve = 0
+        else:
+            _bic_no_improve += 1
+
         if verbose:
-            print(f'  K={K}: V={V_K:.4f} mm³  nfev={rK.nfev}  t={t_K*1000:.0f}ms')
+            print(f'  K={K}: V={V_K:.4f} mm³  nfev={rK.nfev}  t={t_K*1000:.0f}ms  BIC={_bic_K:.4f}')
+
+        if _bic_no_improve >= _bic_patience:
+            if verbose:
+                print(f'  → early stop en K={K} (BIC no mejora {_bic_patience} iteraciones)')
+            break
 
     return res_all
 
@@ -503,7 +410,8 @@ def select_k_bic(results_dict, Z_diff_clean, rows_def_s, cols_def_s, x_obs, y_ob
 
 def compute_obb_metrics(p_best_pos, p_best_neg, rows_def_s, cols_def_s,
                         pix_mm, thr_frac=0.05, nc_m=300, nr_m=150):
-    """OBB por PCA sobre envolvente de splats. Devuelve dict de métricas."""
+    """OBB por PCA sobre los píxeles reales de la máscara del defecto.
+    Los splats se usan solo para h_max/h_min y visualización."""
     c_m = np.linspace(float(cols_def_s.min()), float(cols_def_s.max()), nc_m)
     r_m = np.linspace(float(rows_def_s.min()), float(rows_def_s.max()), nr_m)
     CM, RM = np.meshgrid(c_m, r_m)
@@ -518,11 +426,15 @@ def compute_obb_metrics(p_best_pos, p_best_neg, rows_def_s, cols_def_s,
     Z_envelope  = np.maximum(Z_spl_pos, Z_spl_neg)
     mask_active = Z_envelope > thr_frac * float(Z_envelope.max())
 
-    if mask_active.any():
-        r_act, c_act = np.where(mask_active)
-        pts_mm = np.column_stack([xm[r_act, c_act], ym[r_act, c_act]])
+    # OBB calculado sobre los píxeles reales de la máscara (no sobre las colas
+    # del modelo Gaussiano, que se extienden hasta ~2.45σ más allá del defecto)
+    pts_mm = np.column_stack([cols_def_s.astype(float) * pix_mm,
+                               rows_def_s.astype(float) * pix_mm])
+    if len(pts_mm) >= 2:
         mu  = pts_mm.mean(axis=0)
         cov = np.cov((pts_mm - mu).T)
+        if cov.ndim < 2:
+            cov = np.eye(2) * float(cov)
         eig_vals, eig_vecs = np.linalg.eigh(cov)
         order    = np.argsort(eig_vals)[::-1]
         eig_vecs = eig_vecs[:, order]
@@ -551,11 +463,11 @@ def compute_obb_metrics(p_best_pos, p_best_neg, rows_def_s, cols_def_s,
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def prepare_sample(sample: str, base_dir: str, **kwargs) -> dict:
-    """Carga y preprocesa una muestra completa (XYZ + normales + segmentación).
+    """Carga y preprocesa una muestra completa (XYZ + relleno + mediana).
 
-    Esta función es la parte costosa del pipeline y se ejecuta UNA SOLA VEZ
-    por muestra, aunque haya varios defectos. Devuelve un dict con todos los
-    arrays compartidos necesarios para analizar cada defecto individualmente.
+    Se ejecuta UNA SOLA VEZ por muestra aunque haya varios defectos.
+    Devuelve un dict con los arrays compartidos necesarios para analizar
+    cada defecto individualmente con analyze_polygon().
     """
     p = {**DEFAULT_PARAMS, **kwargs}
 
@@ -565,43 +477,22 @@ def prepare_sample(sample: str, base_dir: str, **kwargs) -> dict:
         sample, entities, H, W, p['erosion_px'])
 
     # ── 2. Preprocesado ───────────────────────────────────────────────────────
-    # Para la segmentación de superficie usamos la máscara UNIÓN (todos los
-    # defectos), de forma que ningún defecto contamina la clasificación θ.
-    ker_er = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (2 * p['erosion_px'] + 1, 2 * p['erosion_px'] + 1))
-    defect_mask_union = cv2.erode(defect_mask_raw, ker_er)
-
     Z_smooth = preprocess_z(Z, valid, p['med_win'])
 
-    # ── 3. Normales SG ────────────────────────────────────────────────────────
-    Nx, Ny, Nz, theta, phi, pix_mm = sg2d_normals(
-        Z_smooth, valid, X, Y, H, W, p['sg_win_px'])
-
-    # ── 4. Segmentación global (excluye TODOS los defectos) ───────────────────
-    (seg_flat, seg_wall, flat_label_img, K_flat,
-     phi_bin, surf_label_base, K_surf) = segment_surfaces(
-        Z, valid, theta, phi, defect_mask_union.astype(bool),
-        p['thr_tapa_deg'], p['n_wall_bins'])
+    # pix_mm: resolución espacial (mm/px) desde el rango métrico de X e Y
+    dx = float((X[valid].max() - X[valid].min()) / W)
+    dy = float((Y[valid].max() - Y[valid].min()) / H)
+    pix_mm = (dx + dy) / 2
 
     return dict(
-        sample          = sample,
-        base_dir        = base_dir,
-        entities        = entities,
+        sample   = sample,
+        entities = entities,
         X=X, Y=Y, Z=Z, H=H, W=W,
-        valid           = valid,
-        Z_smooth        = Z_smooth,
-        Nx=Nx, Ny=Ny, Nz=Nz,
-        theta           = theta,
-        phi             = phi,
-        pix_mm          = pix_mm,
-        seg_flat        = seg_flat,
-        seg_wall        = seg_wall,
-        flat_label_img  = flat_label_img,
-        K_flat          = K_flat,
-        surf_label_base = surf_label_base,   # sin extender (se extiende por defecto)
-        K_surf          = K_surf,
-        polygons        = polygons,
-        params          = p,
+        valid    = valid,
+        Z_smooth = Z_smooth,
+        pix_mm   = pix_mm,
+        polygons = polygons,
+        params   = p,
     )
 
 
@@ -616,14 +507,12 @@ def analyze_polygon(polygon: np.ndarray, shared: dict, defect_idx: int = 0,
     defect_idx : índice del defecto dentro de la muestra (para identificación)
     verbose    : imprimir progreso del ajuste multi-splat
     """
-    p   = shared['params']
-    X   = shared['X'];   Y   = shared['Y'];   Z   = shared['Z']
-    H   = shared['H'];   W   = shared['W']
-    valid    = shared['valid']
-    phi      = shared['phi']
-    pix_mm   = shared['pix_mm']
-    K_flat   = shared['K_flat']
-    sample   = shared['sample']
+    p      = shared['params']
+    X      = shared['X'];   Y = shared['Y'];   Z = shared['Z']
+    H      = shared['H'];   W = shared['W']
+    valid  = shared['valid']
+    pix_mm = shared['pix_mm']
+    sample = shared['sample']
 
     t_start = time.perf_counter()
 
@@ -637,13 +526,6 @@ def analyze_polygon(polygon: np.ndarray, shared: dict, defect_idx: int = 0,
     if defect_mask.sum() == 0:
         # Si la erosión elimina toda la máscara, usar la original
         defect_mask = mask_raw.copy()
-
-    # ── Extender etiquetas de superficie al defecto ────────────────────────────
-    # Partimos de surf_label_base (sin extender) para cada defecto independiente
-    surf_label = shared['surf_label_base'].copy()
-    surf_label, _ = extend_labels_geometric(
-        surf_label, valid, defect_mask, phi, pix_mm,
-        p['search_mm'], H, W)
 
     # ── Z_nom por griddata ────────────────────────────────────────────────────
     (Z_nom, Z_diff, z_def_vals,
@@ -693,7 +575,6 @@ def analyze_polygon(polygon: np.ndarray, shared: dict, defect_idx: int = 0,
         sample      = sample,
         defect_idx  = defect_idx,
         pix_mm      = pix_mm,
-        K_flat      = K_flat,
         n_defect_px = int(mask_def_valid.sum()),
         Z_diff_std  = float(np.nanstd(z_def_vals))  if len(z_def_vals) else float('nan'),
         Z_diff_min  = float(np.nanmin(z_def_vals))  if len(z_def_vals) else float('nan'),
